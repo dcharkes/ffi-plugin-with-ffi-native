@@ -1,17 +1,23 @@
+// ignore_for_file: constant_identifier_names
 
 import 'dart:async';
 import 'dart:ffi';
 import 'dart:io';
 import 'dart:isolate';
 
-import 'my_plugin_bindings_generated.dart';
+import 'package:native_assets_cli/native_assets_cli.dart';
+import 'package:ffi/ffi.dart';
+import 'my_plugin_bindings_generated.dart' as bindings;
 
 /// A very short-lived native function.
 ///
 /// For very short-lived functions, it is fine to call them on the main isolate.
 /// They will block the Dart execution while running the native function, so
 /// only do this for native functions which are guaranteed to be short-lived.
-int sum(int a, int b) => _bindings.sum(a, b);
+int sum(int a, int b) {
+  ensureDylibGloballyOpened();
+  return bindings.sum(a, b);
+}
 
 /// A longer lived native function, which occupies the thread calling it.
 ///
@@ -24,6 +30,7 @@ int sum(int a, int b) => _bindings.sum(a, b);
 /// 1. Reuse a single isolate for various different kinds of requests.
 /// 2. Use multiple helper isolates for parallel execution.
 Future<int> sumAsync(int a, int b) async {
+  ensureDylibGloballyOpened();
   final SendPort helperIsolateSendPort = await _helperIsolateSendPort;
   final int requestId = _nextSumRequestId++;
   final _SumRequest request = _SumRequest(requestId, a, b);
@@ -35,23 +42,64 @@ Future<int> sumAsync(int a, int b) async {
 
 const String _libName = 'my_plugin';
 
-/// The dynamic library in which the symbols for [MyPluginBindings] can be found.
-final DynamicLibrary _dylib = () {
-  if (Platform.isMacOS || Platform.isIOS) {
-    return DynamicLibrary.open('$_libName.framework/$_libName');
-  }
-  if (Platform.isAndroid || Platform.isLinux) {
-    return DynamicLibrary.open('lib$_libName.so');
-  }
-  if (Platform.isWindows) {
-    return DynamicLibrary.open('$_libName.dll');
-  }
-  throw UnsupportedError('Unknown platform: ${Platform.operatingSystem}');
-}();
+/// On Linux and Android.
+const RTLD_LAZY = 0x00001;
 
-/// The bindings to the native functions in [_dylib].
-final MyPluginBindings _bindings = MyPluginBindings(_dylib);
+/// On Android Arm.
+const RTLD_GLOBAL_android_arm32 = 0x00002;
 
+/// On Linux and Android Arm64.
+const RTLD_GLOBAL_rest = 0x00100;
+
+final RTLD_GLOBAL = Abi.current() == Abi.androidArm
+    ? RTLD_GLOBAL_android_arm32
+    : RTLD_GLOBAL_rest;
+
+final RTLD_DEFAULT_android = Pointer<Void>.fromAddress(0);
+
+@Native<Pointer<Void> Function(Pointer<Char>, Int)>()
+external Pointer<Void> dlopen(Pointer<Char> file, int mode);
+
+@Native<Pointer<Void> Function(Pointer<Void>, Pointer<Char>)>()
+external Pointer<Void> dlsym(Pointer<Void> handle, Pointer<Char> symbol);
+
+Object? _cache;
+
+void ensureDylibGloballyOpened() {
+  assert(Platform.isAndroid);
+  if (_cache != null) {
+    return;
+  }
+
+  final dylibName = Target.current.os.dylibFileName(_libName);
+  return using((arena) {
+    // DynamicLibrary.process() is the same as RTLD_DEFAULT.
+    // Looking up with DynamicLibrary.process() should fail at this point.
+    final sumHandleInDefault1 = dlsym(
+        RTLD_DEFAULT_android, 'sum'.toNativeUtf8(allocator: arena).cast());
+    print(['sumHandleInDefault1', sumHandleInDefault1]);
+    final providesSum1 = DynamicLibrary.process().providesSymbol('sum');
+    print(['providesSum1', providesSum1]);
+
+    print('Globally opening $dylibName.');
+    final dylibHandle = dlopen(dylibName.toNativeUtf8(allocator: arena).cast(),
+        RTLD_LAZY | RTLD_GLOBAL);
+    print(['dylibHandle', dylibHandle]);
+    _cache = dylibHandle;
+
+    // Now lookup should succeed.
+    // It succeeds with directly calling dlsym.
+    final sumHandleInDefault2 = dlsym(
+        RTLD_DEFAULT_android, 'sum'.toNativeUtf8(allocator: arena).cast());
+    print(['sumHandleInDefault2', sumHandleInDefault2]);
+    // But it fails with `DynamicLibrary.process()` on the emulator.
+    // On an arm64 Android device this succeeds.
+    final providesSum2 = DynamicLibrary.process().providesSymbol('sum');
+    if (!providesSum2) {
+      throw Exception('"sum" is not available in the Process');
+    }
+  });
+}
 
 /// A request to compute `sum`.
 ///
@@ -113,7 +161,7 @@ Future<SendPort> _helperIsolateSendPort = () async {
       ..listen((dynamic data) {
         // On the helper isolate listen to requests and respond to them.
         if (data is _SumRequest) {
-          final int result = _bindings.sum_long_running(data.a, data.b);
+          final int result = bindings.sum_long_running(data.a, data.b);
           final _SumResponse response = _SumResponse(data.id, result);
           sendPort.send(response);
           return;
